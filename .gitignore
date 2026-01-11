@@ -1,3 +1,4 @@
 /target
 perf.data
 perf.data.old
+scripts/build-and-open-admin.sh

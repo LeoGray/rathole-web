@@ -13,6 +13,7 @@ while staying closely aligned with upstream development.
 - [Rathole Web](#rathole-web)
   - [Relationship with Rathole Core](#relationship-with-rathole-core)
   - [Features](#features)
+  - [Screenshot](#screenshot)
   - [Quickstart](#quickstart)
   - [Configuration](#configuration)
 
@@ -35,6 +36,10 @@ The following remain from upstream Rathole:
 - **Low Resource Consumption** Consumes much fewer memory than similar tools. See [Benchmark](#benchmark). [The binary can be](docs/build-guide.md) **as small as ~500KiB** to fit the constraints of devices, like embedded devices as routers.
 - **Security** Tokens of services are mandatory and service-wise. The server and clients are responsible for their own configs. With the optional Noise Protocol, encryption can be configured at ease. No need to create a self-signed certificate! TLS is also supported.
 - **Hot Reload** Services can be added or removed dynamically by hot-reloading the configuration file. HTTP API is WIP.
+
+## Screenshot
+
+![Admin UI (English)](docs/img/webUI_screenshot_en.png)
 
 ## Quickstart
 

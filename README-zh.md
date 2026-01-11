@@ -11,6 +11,7 @@ Rathole Web 是 Rathole 的 Web 控制平面，提供基于浏览器的管理、
 - [Rathole Web](#rathole-web)
   - [与 Rathole 的关系](#与-rathole-的关系)
   - [Features](#features)
+  - [界面截图](#界面截图)
   - [Quickstart](#quickstart)
   - [Configuration](#configuration)
 
@@ -33,6 +34,10 @@ Rathole Web 不是为了取代 Rathole 的分叉。
 - **低资源消耗** 内存占用远低于同类工具。见[Benchmark](#benchmark)。[二进制文件最小](docs/build-guide.md)可以到 **~500KiB**，可以部署在嵌入式设备如路由器上。
 - **安全性** 每个服务单独强制鉴权。Server 和 Client 负责各自的配置。使用 Noise Protocol 可以简单地配置传输加密，而不需要自签证书。同时也支持 TLS。
 - **热重载** 支持配置文件热重载，动态修改端口转发服务。HTTP API 正在开发中。
+
+## 界面截图
+
+![管理面板（中文）](docs/img/webUI_screenshot_zh.png)
 
 ## Quickstart
 
