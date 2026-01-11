@@ -1,3 +1,4 @@
+use crate::admin;
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
@@ -228,10 +229,12 @@ impl<T: 'static + Transport> Server<T> {
                 ServerServiceChange::Add(cfg) => {
                     let hash = protocol::digest(cfg.name.as_bytes());
                     let mut wg = self.services.write().await;
+                    let name = cfg.name.clone();
                     let _ = wg.insert(hash, cfg);
 
                     let mut wg = self.control_channels.write().await;
                     let _ = wg.remove1(&hash);
+                    admin::add_service(&name).await;
                 }
                 ServerServiceChange::Delete(s) => {
                     let hash = protocol::digest(s.as_bytes());
@@ -239,6 +242,7 @@ impl<T: 'static + Transport> Server<T> {
 
                     let mut wg = self.control_channels.write().await;
                     let _ = wg.remove1(&hash);
+                    admin::remove_service(&s).await;
                 }
             },
             ignored => warn!("Ignored {:?} since running as a server", ignored),
@@ -348,6 +352,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");
+        admin::set_service_status(service_name, true).await;
         let handle =
             ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
 
@@ -404,6 +409,7 @@ where
         service: ServerServiceConfig,
         heartbeat_interval: u64,
     ) -> ControlChannelHandle<T> {
+        let service_name = service.name.clone();
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
 
@@ -468,6 +474,7 @@ where
             shutdown_rx,
             data_ch_req_rx,
             heartbeat_interval,
+            service_name,
         };
 
         // Run the control channel
@@ -494,6 +501,7 @@ struct ControlChannel<T: Transport> {
     shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
     data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
     heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
+    service_name: String,
 }
 
 impl<T: Transport> ControlChannel<T> {
@@ -538,6 +546,7 @@ impl<T: Transport> ControlChannel<T> {
             }
         }
 
+        admin::set_service_status(&self.service_name, false).await;
         info!("Control channel shutdown");
 
         Ok(())

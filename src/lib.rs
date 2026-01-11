@@ -1,3 +1,4 @@
+mod admin;
 mod cli;
 mod config;
 mod config_watcher;
@@ -120,7 +121,40 @@ async fn run_instance(
     shutdown_rx: broadcast::Receiver<bool>,
     service_update: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
-    match determine_run_mode(&config, &args) {
+    let run_mode = determine_run_mode(&config, &args);
+
+    if let Some(admin_cfg) = config.admin.clone() {
+        let mut admin_services = Vec::new();
+        match run_mode {
+            RunMode::Server => {
+                if let Some(server) = config.server.as_ref() {
+                    admin_services.extend(server.services.keys().cloned());
+                }
+            }
+            RunMode::Client => {
+                if let Some(client) = config.client.as_ref() {
+                    admin_services.extend(client.services.keys().cloned());
+                }
+            }
+            RunMode::Undetermine => {}
+        }
+
+        let admin_shutdown_rx = shutdown_rx.resubscribe();
+        let config_path = args
+            .config_path
+            .clone()
+            .expect("Config path should present when admin enabled");
+        admin::init_admin(
+            config_path,
+            admin_cfg,
+            run_mode,
+            admin_services,
+            admin_shutdown_rx,
+        )
+        .await?;
+    }
+
+    match run_mode {
         RunMode::Undetermine => panic!("Cannot determine running as a server or a client"),
         RunMode::Client => {
             #[cfg(not(feature = "client"))]
@@ -137,8 +171,8 @@ async fn run_instance(
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
-enum RunMode {
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum RunMode {
     Server,
     Client,
     Undetermine,
@@ -240,6 +274,7 @@ mod tests {
                     true => Some(ClientConfig::default()),
                     false => None,
                 },
+                admin: None,
             };
 
             let args = Cli {

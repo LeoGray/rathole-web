@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::env;
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::path::Path;
@@ -229,16 +230,32 @@ pub struct ServerConfig {
     pub heartbeat_interval: u64,
 }
 
+fn default_admin_bind() -> String {
+    String::from("127.0.0.1:2334")
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    #[serde(default = "default_admin_bind")]
+    pub bind_addr: String,
+    pub token: MaskedString,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: Option<ServerConfig>,
     pub client: Option<ClientConfig>,
+    pub admin: Option<AdminConfig>,
 }
 
 impl Config {
-    fn from_str(s: &str) -> Result<Config> {
+    pub(crate) fn from_str(s: &str) -> Result<Config> {
         let mut config: Config = toml::from_str(s).with_context(|| "Failed to parse the config")?;
+
+        // Allow overriding admin settings via env vars to simplify deployment
+        apply_admin_env(&mut config);
 
         if let Some(server) = config.server.as_mut() {
             Config::validate_server_config(server)?;
@@ -246,6 +263,10 @@ impl Config {
 
         if let Some(client) = config.client.as_mut() {
             Config::validate_client_config(client)?;
+        }
+
+        if let Some(admin) = config.admin.as_ref() {
+            Config::validate_admin_config(admin)?;
         }
 
         if config.server.is_none() && config.client.is_none() {
@@ -326,6 +347,13 @@ impl Config {
         }
     }
 
+    fn validate_admin_config(admin: &AdminConfig) -> Result<()> {
+        if admin.token.0.trim().is_empty() {
+            bail!("`admin.token` must not be empty");
+        }
+        Ok(())
+    }
+
     pub async fn from_file(path: &Path) -> Result<Config> {
         let s: String = fs::read_to_string(path)
             .await
@@ -334,6 +362,27 @@ impl Config {
             "Configuration is invalid. Please refer to the configuration specification."
         })
     }
+}
+
+fn apply_admin_env(config: &mut Config) {
+    let token_env = env::var("RATHOLE_ADMIN_TOKEN").ok();
+    let bind_env = env::var("RATHOLE_ADMIN_BIND").ok();
+
+    if token_env.is_none() && bind_env.is_none() {
+        return;
+    }
+
+    let mut admin_cfg = config.admin.clone().unwrap_or_default();
+
+    if let Some(token) = token_env {
+        admin_cfg.token = MaskedString(token);
+    }
+
+    if let Some(bind) = bind_env {
+        admin_cfg.bind_addr = bind;
+    }
+
+    config.admin = Some(admin_cfg);
 }
 
 #[cfg(test)]

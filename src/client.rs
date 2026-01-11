@@ -1,3 +1,4 @@
+use crate::admin;
 use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
 use crate::config_watcher::{ClientServiceChange, ConfigChange};
 use crate::helper::udp_connect;
@@ -155,10 +156,12 @@ impl<T: 'static + Transport> Client<T> {
                         self.transport.clone(),
                         self.config.heartbeat_timeout,
                     );
-                    let _ = self.service_handles.insert(name, handle);
+                    let _ = self.service_handles.insert(name.clone(), handle);
+                    admin::add_service(&name).await;
                 }
                 ClientServiceChange::Delete(s) => {
                     let _ = self.service_handles.remove(&s);
+                    admin::remove_service(&s).await;
                 }
             },
             ignored => warn!("Ignored {:?} since running as a client", ignored),
@@ -227,7 +230,8 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6).await?;
+            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6)
+                .await?;
         }
     }
     Ok(())
@@ -255,7 +259,11 @@ async fn run_data_channel_for_tcp<T: Transport>(
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str, prefer_ipv6: bool) -> Result<()> {
+async fn run_data_channel_for_udp<T: Transport>(
+    conn: T::Stream,
+    local_addr: &str,
+    prefer_ipv6: bool,
+) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
@@ -450,6 +458,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
             }
         }
 
+        admin::set_service_status(&self.service.name, true).await;
         // Channel ready
         info!("Control channel established");
 
@@ -489,6 +498,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
             }
         }
 
+        admin::set_service_status(&self.service.name, false).await;
         info!("Control channel shutdown");
         Ok(())
     }

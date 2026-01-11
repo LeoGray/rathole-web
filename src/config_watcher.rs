@@ -204,6 +204,10 @@ fn calculate_events(old: &Config, new: &Config) -> Option<Vec<ConfigChange>> {
         return None;
     }
 
+    if old.admin != new.admin {
+        return Some(vec![ConfigChange::General(Box::new(new.clone()))]);
+    }
+
     if (old.server.is_some() != new.server.is_some())
         || (old.client.is_some() != new.client.is_some())
     {
@@ -287,10 +291,12 @@ mod test {
                 old: Config {
                     server: Some(Default::default()),
                     client: None,
+                    admin: None,
                 },
                 new: Config {
                     server: Some(Default::default()),
                     client: Some(Default::default()),
+                    admin: None,
                 },
             },
             Test {
@@ -300,6 +306,7 @@ mod test {
                         ..Default::default()
                     }),
                     client: None,
+                    admin: None,
                 },
                 new: Config {
                     server: Some(ServerConfig {
@@ -308,12 +315,14 @@ mod test {
                         ..Default::default()
                     }),
                     client: None,
+                    admin: None,
                 },
             },
             Test {
                 old: Config {
                     server: Some(Default::default()),
                     client: None,
+                    admin: None,
                 },
                 new: Config {
                     server: Some(ServerConfig {
@@ -321,6 +330,7 @@ mod test {
                         ..Default::default()
                     }),
                     client: None,
+                    admin: None,
                 },
             },
             Test {
@@ -330,10 +340,12 @@ mod test {
                         ..Default::default()
                     }),
                     client: None,
+                    admin: None,
                 },
                 new: Config {
                     server: Some(Default::default()),
                     client: None,
+                    admin: None,
                 },
             },
             Test {
@@ -346,6 +358,7 @@ mod test {
                         services: collection!(String::from("foo1") => ClientServiceConfig::with_name("foo1"), String::from("foo2") => ClientServiceConfig::with_name("foo2")),
                         ..Default::default()
                     }),
+                    admin: None,
                 },
                 new: Config {
                     server: Some(ServerConfig {
@@ -356,6 +369,7 @@ mod test {
                         services: collection!(String::from("bar1") => ClientServiceConfig::with_name("bar1"), String::from("bar2") => ClientServiceConfig::with_name("bar2")),
                         ..Default::default()
                     }),
+                    admin: None,
                 },
             },
         ];
@@ -416,10 +430,12 @@ mod test {
                 &Config {
                     server: Default::default(),
                     client: None,
+                    admin: None,
                 },
                 &Config {
                     server: Default::default(),
                     client: None,
+                    admin: None,
                 },
             ),
             None

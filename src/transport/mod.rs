@@ -70,16 +70,17 @@ pub trait Transport: Debug + Send + Sync {
 mod tcp;
 pub use tcp::TcpTransport;
 
-#[cfg(all(feature = "native-tls", feature = "rustls"))]
-compile_error!("Only one of `native-tls` and `rustls` can be enabled");
-
-#[cfg(feature = "native-tls")]
+#[cfg(all(feature = "native-tls", not(feature = "rustls")))]
 mod native_tls;
-#[cfg(feature = "native-tls")]
-use native_tls as tls;
 #[cfg(feature = "rustls")]
 mod rustls;
-#[cfg(feature = "rustls")]
+
+// Prefer rustls when both TLS features are enabled to avoid alias clash
+#[cfg(all(feature = "native-tls", not(feature = "rustls")))]
+use native_tls as tls;
+#[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+use rustls as tls;
+#[cfg(all(feature = "native-tls", feature = "rustls"))]
 use rustls as tls;
 
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
