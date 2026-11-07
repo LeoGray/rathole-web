@@ -84,6 +84,7 @@ Server/Client config stays the same as upstream; see upstream docs or this repoâ
   auth_fail_limit = 10
   auth_ban_secs = 300
   ```
+- **IP-free logs.** `log_ips = false` under `[server]` replaces client and visitor addresses in the server's logs, and admin-UI login sources, with `<redacted>`. The default is `true`. The throttle still works without them.
 - **No service enumeration.** An unknown service name gets the same `AuthFailed` reply as a wrong token, so a client sees "Incorrect token" in both cases; the server log says which.
 - **Handshake deadline.** A connection that doesn't send its hello or auth within 10 seconds is closed.
 

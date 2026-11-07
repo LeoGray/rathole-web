@@ -1,5 +1,5 @@
 use crate::auth_throttle::{AuthThrottle, Failure};
-use crate::helper::constant_time_eq;
+use crate::helper::{constant_time_eq, log_ip};
 use crate::{config::AdminConfig, Config, RunMode};
 use anyhow::{anyhow, bail, Context, Result};
 use hyper::body::HttpBody;
@@ -481,7 +481,7 @@ async fn handle(
     if !authorized(&req, &ctx.token) {
         match ctx.throttle.record_failure(peer.ip()) {
             Failure::Banned => warn!(
-                %peer,
+                peer = %log_ip(peer),
                 "Admin UI: refusing source for {}s after repeated bad tokens",
                 ADMIN_BAN.as_secs()
             ),
