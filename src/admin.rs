@@ -1,4 +1,4 @@
-use crate::auth_throttle::{AuthThrottle, Failure};
+use crate::auth_throttle::{AuthThrottle, Failure, SourceKey};
 use crate::helper::{constant_time_eq, log_ip};
 use crate::{config::AdminConfig, Config, RunMode};
 use anyhow::{anyhow, bail, Context, Result};
@@ -482,7 +482,8 @@ async fn handle(
         match ctx.throttle.record_failure(peer.ip()) {
             Failure::Banned => warn!(
                 peer = %log_ip(peer),
-                "Admin UI: refusing source for {}s after repeated bad tokens",
+                "Admin UI: refusing {} for {}s after repeated bad tokens",
+                log_ip(SourceKey::from_ip(peer.ip())),
                 ADMIN_BAN.as_secs()
             ),
             Failure::Counted(_) | Failure::AlreadyBanned => {}
