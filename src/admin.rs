@@ -1,23 +1,54 @@
+use crate::auth_throttle::{AuthThrottle, Failure};
+use crate::helper::constant_time_eq;
 use crate::{config::AdminConfig, Config, RunMode};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use hyper::body::HttpBody;
+use hyper::header::HeaderValue;
+use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
-use hyper::{body::to_bytes, Body, Method, Request, Response, Server, StatusCode};
+use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use lazy_static::lazy_static;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-#[derive(Clone)]
+/// Value shown in place of each secret by `GET /api/config`. A `PUT` that
+/// still contains it keeps the secret currently on disk.
+const REDACTED: &str = "<redacted>";
+/// Keys whose values are secrets anywhere in the config
+const SECRET_KEYS: &[&str] = &[
+    "token",
+    "default_token",
+    "local_private_key",
+    "pkcs12_password",
+];
+/// Largest config accepted by `PUT /api/config`
+const MAX_CONFIG_BYTES: usize = 1 << 20;
+/// Failed admin logins from one source before it is refused for `ADMIN_BAN`
+const ADMIN_FAIL_LIMIT: u32 = 5;
+const ADMIN_FAIL_WINDOW: Duration = Duration::from_secs(60);
+const ADMIN_BAN: Duration = Duration::from_secs(300);
+/// The page has inline script and style but loads nothing from elsewhere and
+/// may only talk to this origin, so injected markup can't exfiltrate the token
+const CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+                   connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; \
+                   frame-ancestors 'none'";
+
 pub struct AdminContext {
     pub mode: RunMode,
     pub bind_addr: String,
     pub token: String,
     pub config_path: PathBuf,
-    pub status: Arc<RwLock<HashMap<String, bool>>>,
+    /// Live control channels per service. A count rather than a flag, because a
+    /// replaced channel reports its shutdown after its successor connected.
+    pub status: Arc<RwLock<HashMap<String, u32>>>,
+    throttle: AuthThrottle,
 }
 
 lazy_static! {
@@ -258,8 +289,10 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
       loadConfig();
     }
 
-    function getToken() { return localStorage.getItem('rathole_admin_token') || ''; }
-    function saveToken() { localStorage.setItem('rathole_admin_token', tokenInput.value); msg.textContent = t('tokenSaved'); setTimeout(()=>msg.textContent='',1500); }
+    // sessionStorage: the token is gone when the tab closes instead of staying on disk
+    try { localStorage.removeItem('rathole_admin_token'); } catch (e) {}
+    function getToken() { try { return sessionStorage.getItem('rathole_admin_token') || ''; } catch (e) { return ''; } }
+    function saveToken() { try { sessionStorage.setItem('rathole_admin_token', tokenInput.value); } catch (e) {} msg.textContent = t('tokenSaved'); setTimeout(()=>msg.textContent='',1500); }
     tokenInput.value = getToken();
     applyLang();
 
@@ -272,6 +305,10 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
       return res;
     }
 
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
     async function loadStatus() {
       try {
         const res = await api('/api/status');
@@ -280,7 +317,7 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
         statusBody.innerHTML = data.services.map(s => {
           const cls = s.connected ? 'ok' : 'bad';
           const text = s.connected ? t('connected') : t('disconnected');
-          return `<tr><td>${s.name}</td><td><span class="status-chip ${cls}"><span class="dot"></span>${text}</span></td></tr>`;
+          return `<tr><td>${esc(s.name)}</td><td><span class="status-chip ${cls}"><span class="dot"></span>${text}</span></td></tr>`;
         }).join('');
       } catch (e) { msg.textContent = t('loadStatusFailed') + e.message; }
     }
@@ -323,6 +360,7 @@ pub async fn init_admin(
         token: admin_cfg.token.to_string(),
         config_path,
         status: Arc::new(RwLock::new(HashMap::new())),
+        throttle: AuthThrottle::new(ADMIN_FAIL_LIMIT, ADMIN_FAIL_WINDOW, ADMIN_BAN),
     });
 
     {
@@ -333,31 +371,42 @@ pub async fn init_admin(
     {
         let mut status = ctx.status.write().await;
         for name in services {
-            status.insert(name, false);
+            status.insert(name, 0);
         }
     }
 
-    let bind_addr = ctx.bind_addr.parse().context("Invalid admin bind_addr")?;
+    let bind_addr: SocketAddr = ctx.bind_addr.parse().context("Invalid admin bind_addr")?;
+    if !bind_addr.ip().is_loopback() {
+        warn!(
+            "Admin UI on non-loopback address {} is plain HTTP: the admin token and config secrets \
+             cross the network unencrypted. Prefer 127.0.0.1 with an SSH tunnel or a TLS proxy",
+            bind_addr
+        );
+    }
+    // try_bind: Server::bind panics on failure, which aborts the whole process
+    let builder = Server::try_bind(&bind_addr)
+        .with_context(|| format!("Failed to bind the admin UI to {}", bind_addr))?;
     let server_ctx = ctx.clone();
 
     tokio::spawn(async move {
         info!("Admin UI listening at {}", server_ctx.bind_addr);
-        let make_svc = make_service_fn(move |_| {
+        let make_svc = make_service_fn(move |conn: &AddrStream| {
             let ctx = server_ctx.clone();
+            let peer = conn.remote_addr();
             async move {
                 Ok::<_, hyper::Error>(service_fn(move |req| {
                     let ctx = ctx.clone();
                     async move {
-                        match handle(req, ctx.clone()).await {
-                            Ok(resp) => Ok::<_, hyper::Error>(resp),
+                        match handle(req, peer, ctx.clone()).await {
+                            Ok(resp) => Ok::<_, hyper::Error>(with_security_headers(resp)),
                             Err(err) => {
                                 error!("{:#}", err);
-                                Ok::<_, hyper::Error>(
+                                Ok::<_, hyper::Error>(with_security_headers(
                                     Response::builder()
                                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                                         .body(Body::from("internal error"))
                                         .unwrap(),
-                                )
+                                ))
                             }
                         }
                     }
@@ -365,7 +414,7 @@ pub async fn init_admin(
             }
         });
 
-        let server = Server::bind(&bind_addr).serve(make_svc);
+        let server = builder.serve(make_svc);
 
         let graceful = server.with_graceful_shutdown(async move {
             let _ = shutdown_rx.recv().await;
@@ -382,7 +431,7 @@ pub async fn init_admin(
 pub async fn add_service(name: &str) {
     if let Some(ctx) = current_context().await {
         let mut status = ctx.status.write().await;
-        status.insert(name.to_string(), false);
+        status.entry(name.to_string()).or_insert(0);
     }
 }
 
@@ -396,11 +445,12 @@ pub async fn remove_service(name: &str) {
 pub async fn set_service_status(name: &str, connected: bool) {
     if let Some(ctx) = current_context().await {
         let mut status = ctx.status.write().await;
-        if let Some(v) = status.get_mut(name) {
-            *v = connected;
+        let live = status.entry(name.to_string()).or_insert(0);
+        *live = if connected {
+            live.saturating_add(1)
         } else {
-            status.insert(name.to_string(), connected);
-        }
+            live.saturating_sub(1)
+        };
     }
 }
 
@@ -408,20 +458,42 @@ async fn current_context() -> Option<Arc<AdminContext>> {
     ADMIN_CONTEXT.read().await.clone()
 }
 
-async fn handle(req: Request<Body>, ctx: Arc<AdminContext>) -> Result<Response<Body>> {
+async fn handle(
+    req: Request<Body>,
+    peer: SocketAddr,
+    ctx: Arc<AdminContext>,
+) -> Result<Response<Body>> {
     if req.method() == Method::GET && req.uri().path() == "/" {
         return Ok(Response::builder()
-            .header("content-type", "text/html")
+            .header("content-type", "text/html; charset=utf-8")
             .body(Body::from(HTML_PAGE))
             .unwrap());
     }
 
+    if ctx.throttle.is_blocked(peer.ip()) {
+        return Ok(Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("retry-after", ADMIN_BAN.as_secs().to_string())
+            .body(Body::from("too many failed attempts"))
+            .unwrap());
+    }
+
     if !authorized(&req, &ctx.token) {
+        match ctx.throttle.record_failure(peer.ip()) {
+            Failure::Banned => warn!(
+                %peer,
+                "Admin UI: refusing source for {}s after repeated bad tokens",
+                ADMIN_BAN.as_secs()
+            ),
+            Failure::Counted(_) | Failure::AlreadyBanned => {}
+        }
         return Ok(Response::builder()
             .status(StatusCode::UNAUTHORIZED)
+            .header("www-authenticate", "Bearer")
             .body(Body::from("unauthorized"))
             .unwrap());
     }
+    ctx.throttle.record_success(peer.ip());
 
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/api/status") => handle_status(&ctx).await,
@@ -434,24 +506,33 @@ async fn handle(req: Request<Body>, ctx: Arc<AdminContext>) -> Result<Response<B
     }
 }
 
+fn with_security_headers(mut resp: Response<Body>) -> Response<Body> {
+    let h = resp.headers_mut();
+    for (k, v) in [
+        ("content-security-policy", CSP),
+        ("x-frame-options", "DENY"),
+        ("x-content-type-options", "nosniff"),
+        ("referrer-policy", "no-referrer"),
+        // config and status must not linger in browser or proxy caches
+        ("cache-control", "no-store"),
+        ("cross-origin-opener-policy", "same-origin"),
+        ("cross-origin-resource-policy", "same-origin"),
+    ] {
+        h.insert(k, HeaderValue::from_static(v));
+    }
+    resp
+}
+
 fn authorized(req: &Request<Body>, token: &str) -> bool {
     if token.is_empty() {
         return false;
     }
-    match req.headers().get("authorization") {
-        Some(v) => {
-            if let Ok(s) = v.to_str() {
-                let prefix = "Bearer ";
-                if let Some(rest) = s.strip_prefix(prefix) {
-                    rest.trim() == token
-                } else {
-                    s.trim() == token
-                }
-            } else {
-                false
-            }
+    match req.headers().get("authorization").map(|v| v.to_str()) {
+        Some(Ok(s)) => {
+            let given = s.strip_prefix("Bearer ").unwrap_or(s).trim();
+            constant_time_eq(given.as_bytes(), token.as_bytes())
         }
-        None => false,
+        _ => false,
     }
 }
 
@@ -459,9 +540,9 @@ async fn handle_status(ctx: &AdminContext) -> Result<Response<Body>> {
     let status = ctx.status.read().await;
     let mut services: Vec<ServiceStatus> = status
         .iter()
-        .map(|(name, connected)| ServiceStatus {
+        .map(|(name, live)| ServiceStatus {
             name: name.clone(),
-            connected: *connected,
+            connected: *live > 0,
         })
         .collect();
     services.sort_by(|a, b| a.name.cmp(&b.name));
@@ -481,23 +562,314 @@ async fn handle_status(ctx: &AdminContext) -> Result<Response<Body>> {
         .unwrap())
 }
 
+fn text_response(status: StatusCode, msg: String) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from(msg))
+        .unwrap()
+}
+
 async fn handle_get_config(ctx: &AdminContext) -> Result<Response<Body>> {
     let cfg = fs::read_to_string(&ctx.config_path).await?;
-    Ok(Response::builder()
-        .header("content-type", "text/plain; charset=utf-8")
-        .body(Body::from(cfg))
-        .unwrap())
+    match redact_config(&cfg) {
+        Ok(redacted) => Ok(text_response(StatusCode::OK, redacted)),
+        // Never fall back to sending the raw file
+        Err(e) => Ok(text_response(StatusCode::CONFLICT, format!("{:#}", e))),
+    }
 }
 
 async fn handle_put_config(req: Request<Body>, ctx: &AdminContext) -> Result<Response<Body>> {
-    let body = to_bytes(req.into_body()).await?;
+    let body = match read_limited(req.into_body(), MAX_CONFIG_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(text_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("{:#}", e),
+            ))
+        }
+    };
+    let cfg_text = match String::from_utf8(body) {
+        Ok(t) => t,
+        Err(_) => {
+            return Ok(text_response(
+                StatusCode::BAD_REQUEST,
+                "config must be valid utf-8 text".into(),
+            ))
+        }
+    };
+    let current = fs::read_to_string(&ctx.config_path).await?;
     let cfg_text =
-        String::from_utf8(body.to_vec()).map_err(|_| anyhow!("config must be valid utf-8 text"))?;
-    Config::from_str(&cfg_text)?;
+        match restore_secrets(&cfg_text, &current).and_then(|t| Config::from_str(&t).map(|_| t)) {
+            Ok(t) => t,
+            Err(e) => return Ok(text_response(StatusCode::BAD_REQUEST, format!("{:#}", e))),
+        };
     fs::write(&ctx.config_path, cfg_text).await?;
 
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())
         .unwrap())
+}
+
+async fn read_limited(mut body: Body, limit: usize) -> Result<Vec<u8>> {
+    let too_large = || anyhow!("config larger than {} bytes", limit);
+    let declared = body.size_hint().lower() as usize;
+    if declared > limit {
+        bail!(too_large());
+    }
+    let mut buf = Vec::with_capacity(declared);
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        if buf.len() + chunk.len() > limit {
+            bail!(too_large());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// If `line` is `KEY = "VALUE"` (optionally followed by a comment) with KEY a
+/// secret key, return (KEY, byte range of the quoted VALUE including quotes)
+fn secret_assignment(line: &str) -> Option<(&str, std::ops::Range<usize>)> {
+    let eq = line.find('=')?;
+    let key = line[..eq].trim();
+    if !SECRET_KEYS.contains(&key) {
+        return None;
+    }
+    let rest = &line[eq + 1..];
+    let start = eq + 1 + (rest.len() - rest.trim_start().len());
+    let quote = line[start..].chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    // basic strings may contain \" escapes; literal strings can't contain '
+    let mut i = start + 1;
+    let bytes = line.as_bytes();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if quote == '"' => i += 2,
+            c if c == quote as u8 => return Some((key, start..i + 1)),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Table path of a `[a.b."c"]` header line, or None if `line` isn't one
+fn table_header(line: &str) -> Option<Vec<String>> {
+    let t = line.trim();
+    if !t.starts_with('[') || t.starts_with("[[") {
+        return None;
+    }
+    // Let the TOML parser handle quoting: "[a.b]" parses to {a = {b = {}}}
+    let mut v: toml::Value = toml::from_str(t).ok()?;
+    let mut path = Vec::new();
+    while let toml::Value::Table(tbl) = v {
+        match tbl.into_iter().next() {
+            Some((k, inner)) => {
+                path.push(k);
+                v = inner;
+            }
+            None => break,
+        }
+    }
+    Some(path)
+}
+
+/// Replace every secret value with `REDACTED`. Fails rather than leak if a
+/// secret is written in a form this line-based pass doesn't recognize.
+fn redact_config(text: &str) -> Result<String> {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        match secret_assignment(line) {
+            Some((_, range)) => {
+                out.push_str(&line[..range.start]);
+                out.push_str(&format!("\"{}\"", REDACTED));
+                out.push_str(&line[range.end..]);
+            }
+            None => out.push_str(line),
+        }
+    }
+    let parsed: toml::Value = toml::from_str(&out).context("Failed to parse the config")?;
+    if let Some(path) = find_unredacted_secret(&parsed, &mut Vec::new()) {
+        bail!(
+            "Config has a secret at `{}` in a form the admin UI can't redact \
+             (put each secret on its own `key = \"value\"` line); edit it on disk",
+            path.join(".")
+        );
+    }
+    Ok(out)
+}
+
+fn find_unredacted_secret(v: &toml::Value, path: &mut Vec<String>) -> Option<Vec<String>> {
+    match v {
+        toml::Value::Table(t) => {
+            for (k, inner) in t {
+                path.push(k.clone());
+                let leaked = match inner {
+                    toml::Value::String(s) if SECRET_KEYS.contains(&k.as_str()) => s != REDACTED,
+                    _ => false,
+                };
+                if leaked {
+                    return Some(path.clone());
+                }
+                if let Some(p) = find_unredacted_secret(inner, path) {
+                    return Some(p);
+                }
+                path.pop();
+            }
+            None
+        }
+        toml::Value::Array(a) => a.iter().find_map(|x| find_unredacted_secret(x, path)),
+        _ => None,
+    }
+}
+
+/// Put back the on-disk value of every secret left as `REDACTED` in `new`
+fn restore_secrets(new: &str, current: &str) -> Result<String> {
+    if !new.contains(REDACTED) {
+        return Ok(new.to_string());
+    }
+    let current: toml::Value =
+        toml::from_str(current).context("Failed to parse the config on disk")?;
+    let mut table: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(new.len());
+    for line in new.split_inclusive('\n') {
+        if let Some(path) = table_header(line) {
+            table = path;
+        }
+        match secret_assignment(line) {
+            Some((key, range))
+                if line[range.clone()].trim_matches(|c| c == '"' || c == '\'') == REDACTED =>
+            {
+                let mut v = &current;
+                for k in table.iter().map(String::as_str).chain(std::iter::once(key)) {
+                    v = v.get(k).ok_or_else(|| {
+                        anyhow!(
+                            "`{}.{}` is `{}` but has no saved value to keep; enter the secret",
+                            table.join("."),
+                            key,
+                            REDACTED
+                        )
+                    })?;
+                }
+                let original = toml::Value::String(
+                    v.as_str()
+                        .ok_or_else(|| anyhow!("saved `{}` is not a string", key))?
+                        .to_string(),
+                );
+                out.push_str(&line[..range.start]);
+                out.push_str(&original.to_string());
+                out.push_str(&line[range.end..]);
+            }
+            _ => out.push_str(line),
+        }
+    }
+    if out.contains(REDACTED) {
+        bail!(
+            "`{}` is left where a secret can't be restored; enter the secret",
+            REDACTED
+        );
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CFG: &str = r#"# comment with token = "not a secret line"
+[admin]
+token = "admin-secret" # inline comment
+
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = 'lit\eral'
+
+[server.transport]
+type = "noise"
+[server.transport.noise]
+local_private_key = "priv\"key"
+
+[server.services."my svc"]
+token = "svc-secret"
+bind_addr = "0.0.0.0:5202"
+"#;
+
+    #[test]
+    fn redacts_every_secret_and_keeps_layout() {
+        let r = redact_config(CFG).unwrap();
+        for secret in ["admin-secret", "lit\\eral", "priv\\\"key", "svc-secret"] {
+            assert!(!r.contains(secret), "{} leaked", secret);
+        }
+        assert!(r.contains("# comment with token"));
+        assert!(r.contains(r#"token = "<redacted>" # inline comment"#));
+        assert_eq!(r.lines().count(), CFG.lines().count());
+    }
+
+    #[test]
+    fn refuses_secrets_it_cannot_redact() {
+        let inline = "[server]\nbind_addr = \"x\"\nservices = { a = { token = \"s\" } }\n";
+        assert!(redact_config(inline).is_err());
+        let multiline = "[admin]\ntoken = \"\"\"\ns\"\"\"\n";
+        assert!(redact_config(multiline).is_err());
+    }
+
+    #[test]
+    fn round_trip_restores_secrets() {
+        let edited = redact_config(CFG)
+            .unwrap()
+            .replace("0.0.0.0:5202", "0.0.0.0:5203");
+        let restored = restore_secrets(&edited, CFG).unwrap();
+        assert_eq!(
+            restored,
+            CFG.replace("0.0.0.0:5202", "0.0.0.0:5203")
+                .replace("'lit\\eral'", "\"lit\\\\eral\"")
+        );
+        let a: toml::Value = toml::from_str(&restored).unwrap();
+        assert_eq!(
+            a["server"]["transport"]["noise"]["local_private_key"].as_str(),
+            Some("priv\"key")
+        );
+        assert_eq!(a["server"]["default_token"].as_str(), Some("lit\\eral"));
+        assert_eq!(
+            a["server"]["services"]["my svc"]["token"].as_str(),
+            Some("svc-secret")
+        );
+    }
+
+    #[test]
+    fn new_secret_values_pass_through_and_unknown_placeholders_fail() {
+        let edited = redact_config(CFG).unwrap().replacen(
+            r#"token = "<redacted>" # inline"#,
+            r#"token = "new-admin" # inline"#,
+            1,
+        );
+        let restored = restore_secrets(&edited, CFG).unwrap();
+        assert!(restored.contains("new-admin"));
+        assert!(restored.contains("svc-secret"));
+
+        let added = format!(
+            "{}\n[server.services.new]\ntoken = \"<redacted>\"\nbind_addr = \"0.0.0.0:1\"\n",
+            redact_config(CFG).unwrap()
+        );
+        assert!(restore_secrets(&added, CFG).is_err());
+    }
+
+    #[test]
+    fn auth_accepts_bearer_or_bare_token_only_when_equal() {
+        let req = |v: &str| {
+            Request::builder()
+                .header("authorization", v)
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert!(authorized(&req("Bearer abc"), "abc"));
+        assert!(authorized(&req("abc"), "abc"));
+        assert!(!authorized(&req("Bearer abd"), "abc"));
+        assert!(!authorized(&req("Bearer ab"), "abc"));
+        assert!(!authorized(&req("Bearer abc"), ""));
+        assert!(!authorized(&Request::new(Body::empty()), "abc"));
+    }
 }

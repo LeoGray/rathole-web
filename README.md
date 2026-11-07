@@ -74,6 +74,19 @@ Env overrides: `RATHOLE_ADMIN_TOKEN`, `RATHOLE_ADMIN_BIND`.
 
 Server/Client config stays the same as upstream; see upstream docs or this repo’s `examples/` and `docs/transport.md`.
 
+### Security behaviour
+
+- **Admin UI secrets.** `GET /api/config` returns every `token`, `default_token`, `local_private_key` and `pkcs12_password` as `"<redacted>"`. Leave a value as `"<redacted>"` when saving to keep the secret on disk, or type a new value to replace it. If a secret is written in a form the UI can't redact (an inline table, a multi-line string), the UI refuses to show the config; put each secret on its own `key = "value"` line.
+- **Admin UI hardening.** Responses carry a strict Content-Security-Policy, `X-Frame-Options: DENY` and `Cache-Control: no-store`. The browser keeps the token in `sessionStorage`, so it's gone when the tab closes. After 5 bad tokens in a minute, a source gets `429` for 5 minutes. The UI is plain HTTP and logs a warning when bound to a non-loopback address; keep it on 127.0.0.1 and reach it through an SSH tunnel or a TLS proxy.
+- **Handshake throttle.** After `auth_fail_limit` failed handshakes in a minute (default 10; 0 turns it off), the server drops new connections from that source for `auth_ban_secs` (default 300) before any transport handshake. An IPv6 source counts per /64. A successful login clears the count. Note that a misconfigured client also locks out correct clients sharing its address.
+  ```toml
+  [server]
+  auth_fail_limit = 10
+  auth_ban_secs = 300
+  ```
+- **No service enumeration.** An unknown service name gets the same `AuthFailed` reply as a wrong token, so a client sees "Incorrect token" in both cases; the server log says which.
+- **Handshake deadline.** A connection that doesn't send its hello or auth within 10 seconds is closed.
+
 Example config (admin + one service):
 ```toml
 [admin]
