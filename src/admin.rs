@@ -9,7 +9,7 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use lazy_static::lazy_static;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,6 +53,73 @@ pub struct AdminContext {
 
 lazy_static! {
     static ref ADMIN_CONTEXT: RwLock<Option<Arc<AdminContext>>> = RwLock::new(None);
+    static ref EVENTS: std::sync::Mutex<VecDeque<SecurityEvent>> =
+        std::sync::Mutex::new(VecDeque::new());
+}
+
+/// Most recent security events kept for the UI; older ones are dropped
+const MAX_EVENTS: usize = 200;
+/// Set once the admin UI starts; until then there's nobody to show events to
+static EVENTS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    HandshakeFailed,
+    SourceBanned,
+    AdminLoginBanned,
+}
+
+/// A failed handshake or a ban, shown in the admin UI's security panel
+#[derive(Serialize)]
+pub struct SecurityEvent {
+    /// Unix time in seconds
+    time: u64,
+    kind: EventKind,
+    /// The peer, or the banned address range; `<redacted>` when `log_ips` is off
+    source: String,
+    detail: String,
+    /// For bans: how long the source is refused
+    ban_secs: Option<u64>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Remember a security event for `GET /api/events`. `source` (a peer address
+/// or range) goes through `log_ip`, so `log_ips = false` keeps it out of the UI.
+pub fn record_event(
+    kind: EventKind,
+    source: impl std::fmt::Display,
+    detail: String,
+    ban_secs: Option<u64>,
+) {
+    if !EVENTS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let source = log_ip(source).to_string();
+    let mut events = EVENTS.lock().unwrap();
+    if events.len() >= MAX_EVENTS {
+        events.pop_front();
+    }
+    events.push_back(SecurityEvent {
+        time: unix_now(),
+        kind,
+        source,
+        detail,
+        ban_secs,
+    });
+}
+
+#[derive(Serialize)]
+struct EventsResponse<'a> {
+    now: u64,
+    /// Newest first
+    events: Vec<&'a SecurityEvent>,
 }
 
 #[derive(Serialize)]
@@ -175,9 +242,16 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
     .bad { color: var(--error); }
     .bad .dot { background: var(--error); box-shadow: 0 0 6px var(--error); }
     #message { font-size: 12px; color: var(--muted); min-height: 16px; }
+    .alert { border: 1px solid var(--error); color: var(--error); background: var(--panel); padding: 10px 14px; margin-bottom: 14px; font-size: 13px; }
+    .alert[hidden] { display: none; }
+    .alert ul { margin: 6px 0 0; padding-left: 18px; }
+    #events-body td { font-size: 12px; vertical-align: top; }
+    #events-body td.detail { color: var(--muted); word-break: break-word; }
+    #events-empty { font-size: 12px; color: var(--muted); }
   </style>
 </head>
 <body>
+  <div id="alert" class="alert" role="alert" hidden></div>
   <div class="panel">
     <div class="actions">
       <h2 id="token-title">管理令牌</h2>
@@ -196,6 +270,14 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
       <thead><tr><th id="service-name-th">服务名</th><th id="status-th">状态</th></tr></thead>
       <tbody id="status-body"></tbody>
     </table>
+  </div>
+  <div class="panel">
+    <h2 id="events-title">安全事件</h2>
+    <table>
+      <thead><tr><th id="ev-time-th">时间</th><th id="ev-kind-th">事件</th><th id="ev-source-th">来源</th><th id="ev-detail-th">详情</th></tr></thead>
+      <tbody id="events-body"></tbody>
+    </table>
+    <div id="events-empty"></div>
   </div>
   <div class="panel">
     <h2 id="config-title">配置</h2>
@@ -226,7 +308,20 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
         loadConfigFailed: 'Failed to load config: ',
         saveConfigFailed: 'Save failed: ',
         tokenPlaceholder: 'Admin token',
-        langAlt: '中文'
+        langAlt: '中文',
+        eventsTitle: 'Security events',
+        evTime: 'Time',
+        evKind: 'Event',
+        evSource: 'Source',
+        evDetail: 'Detail',
+        evNone: 'No failed handshakes or bans since the server started.',
+        kind_handshake_failed: 'Failed handshake',
+        kind_source_banned: 'Source banned',
+        kind_admin_login_banned: 'Admin login banned',
+        activeBans: 'Active bans:',
+        banUntil: 'until',
+        banFor: 'for',
+        loginBanned: 'Admin login is blocked for this address after repeated bad tokens. Try again in {m} min.'
       },
       zh: {
         tokenTitle: '管理令牌',
@@ -247,7 +342,20 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
         loadConfigFailed: '加载配置失败: ',
         saveConfigFailed: '保存失败: ',
         tokenPlaceholder: '管理 token',
-        langAlt: 'EN'
+        langAlt: 'EN',
+        eventsTitle: '安全事件',
+        evTime: '时间',
+        evKind: '事件',
+        evSource: '来源',
+        evDetail: '详情',
+        evNone: '服务启动以来没有握手失败或封禁。',
+        kind_handshake_failed: '握手失败',
+        kind_source_banned: '来源已封禁',
+        kind_admin_login_banned: '管理登录已封禁',
+        activeBans: '当前封禁:',
+        banUntil: '直到',
+        banFor: '原因',
+        loginBanned: '由于多次输入错误的令牌，此地址的管理登录已被暂时封禁。请在 {m} 分钟后重试。'
       }
     };
 
@@ -276,6 +384,11 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
       document.getElementById('refresh-btn').textContent = t('refreshConfig');
       document.getElementById('save-config-btn').textContent = t('saveConfig');
       document.getElementById('lang-toggle').textContent = t('langAlt');
+      document.getElementById('events-title').textContent = t('eventsTitle');
+      document.getElementById('ev-time-th').textContent = t('evTime');
+      document.getElementById('ev-kind-th').textContent = t('evKind');
+      document.getElementById('ev-source-th').textContent = t('evSource');
+      document.getElementById('ev-detail-th').textContent = t('evDetail');
       tokenInput.placeholder = t('tokenPlaceholder');
       const saveLabel = t('saveToken');
       document.getElementById('save-token-btn').textContent = saveLabel;
@@ -286,6 +399,7 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
       localStorage.setItem('rathole_admin_lang', lang);
       applyLang();
       loadStatus();
+      loadEvents();
       loadConfig();
     }
 
@@ -301,8 +415,51 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
       const token = getToken();
       if (token) headers['Authorization'] = 'Bearer ' + token;
       const res = await fetch(path, { ...options, headers });
+      if (res.status === 429) {
+        const secs = parseInt(res.headers.get('retry-after') || '300', 10);
+        loginBannedUntil = Date.now() + secs * 1000;
+        renderAlert();
+      }
       if (!res.ok) throw new Error(await res.text() || res.statusText);
+      if (loginBannedUntil) { loginBannedUntil = 0; renderAlert(); }
       return res;
+    }
+
+    // Banner: this browser's own login ban, plus bans the server reports
+    const alertBox = document.getElementById('alert');
+    let loginBannedUntil = 0;
+    let activeBans = [];
+
+    function renderAlert() {
+      const parts = [];
+      if (loginBannedUntil > Date.now()) {
+        const m = Math.max(1, Math.ceil((loginBannedUntil - Date.now()) / 60000));
+        parts.push(`<div>${esc(t('loginBanned').replace('{m}', m))}</div>`);
+      }
+      if (activeBans.length) {
+        parts.push(`<div>${esc(t('activeBans'))}</div><ul>` + activeBans.map(e =>
+          `<li>${esc(t('kind_' + e.kind))}: <b>${esc(e.source)}</b> ${esc(t('banUntil'))} ${esc(fmtTime(e.time + e.ban_secs))} (${esc(t('banFor'))}: ${esc(e.detail)})</li>`
+        ).join('') + '</ul>');
+      }
+      alertBox.innerHTML = parts.join('');
+      alertBox.hidden = parts.length === 0;
+    }
+
+    function fmtTime(unix) {
+      return new Date(unix * 1000).toLocaleTimeString();
+    }
+
+    async function loadEvents() {
+      try {
+        const res = await api('/api/events');
+        const data = await res.json();
+        document.getElementById('events-body').innerHTML = data.events.map(e =>
+          `<tr><td>${esc(fmtTime(e.time))}</td><td>${esc(t('kind_' + e.kind))}</td><td>${esc(e.source)}</td><td class="detail">${esc(e.detail)}</td></tr>`
+        ).join('');
+        document.getElementById('events-empty').textContent = data.events.length ? '' : t('evNone');
+        activeBans = data.events.filter(e => e.ban_secs > 0 && e.time + e.ban_secs > data.now);
+        renderAlert();
+      } catch (e) { /* loadStatus reports API errors */ }
     }
 
     function esc(s) {
@@ -340,8 +497,9 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
     }
 
     loadStatus();
+    loadEvents();
     loadConfig();
-    setInterval(loadStatus, 3000);
+    setInterval(() => { loadStatus(); loadEvents(); }, 3000);
   </script>
 </body>
 </html>
@@ -367,6 +525,7 @@ pub async fn init_admin(
         let mut guard = ADMIN_CONTEXT.write().await;
         *guard = Some(ctx.clone());
     }
+    EVENTS_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
 
     {
         let mut status = ctx.status.write().await;
@@ -480,12 +639,21 @@ async fn handle(
 
     if !authorized(&req, &ctx.token) {
         match ctx.throttle.record_failure(peer.ip()) {
-            Failure::Banned => warn!(
-                peer = %log_ip(peer),
-                "Admin UI: refusing {} for {}s after repeated bad tokens",
-                log_ip(SourceKey::from_ip(peer.ip())),
-                ADMIN_BAN.as_secs()
-            ),
+            Failure::Banned => {
+                let range = SourceKey::from_ip(peer.ip());
+                warn!(
+                    peer = %log_ip(peer),
+                    "Admin UI: refusing {} for {}s after repeated bad tokens",
+                    log_ip(range),
+                    ADMIN_BAN.as_secs()
+                );
+                record_event(
+                    EventKind::AdminLoginBanned,
+                    range,
+                    format!("{} bad admin tokens within a minute", ADMIN_FAIL_LIMIT),
+                    Some(ADMIN_BAN.as_secs()),
+                );
+            }
             Failure::Counted(_) | Failure::AlreadyBanned => {}
         }
         return Ok(Response::builder()
@@ -498,6 +666,7 @@ async fn handle(
 
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/api/status") => handle_status(&ctx).await,
+        (&Method::GET, "/api/events") => handle_events(),
         (&Method::GET, "/api/config") => handle_get_config(&ctx).await,
         (&Method::PUT, "/api/config") => handle_put_config(req, &ctx).await,
         _ => Ok(Response::builder()
@@ -548,18 +717,28 @@ async fn handle_status(ctx: &AdminContext) -> Result<Response<Body>> {
         .collect();
     services.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let body = serde_json::to_vec(&StatusResponse {
+    json_response(&StatusResponse {
         mode: match ctx.mode {
             RunMode::Server => "server",
             RunMode::Client => "client",
             RunMode::Undetermine => "unknown",
         },
         services,
-    })?;
+    })
+}
 
+fn handle_events() -> Result<Response<Body>> {
+    let events = EVENTS.lock().unwrap();
+    json_response(&EventsResponse {
+        now: unix_now(),
+        events: events.iter().rev().collect(),
+    })
+}
+
+fn json_response<T: Serialize>(value: &T) -> Result<Response<Body>> {
     Ok(Response::builder()
         .header("content-type", "application/json")
-        .body(Body::from(body))
+        .body(Body::from(serde_json::to_vec(value)?))
         .unwrap())
 }
 
@@ -856,6 +1035,26 @@ bind_addr = "0.0.0.0:5202"
             redact_config(CFG).unwrap()
         );
         assert!(restore_secrets(&added, CFG).is_err());
+    }
+
+    #[test]
+    fn event_list_keeps_only_the_newest() {
+        EVENTS_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..MAX_EVENTS + 5 {
+            record_event(
+                EventKind::HandshakeFailed,
+                format!("src{}", i),
+                String::new(),
+                None,
+            );
+        }
+        let events = EVENTS.lock().unwrap();
+        assert_eq!(events.len(), MAX_EVENTS);
+        assert_eq!(
+            events.back().unwrap().source,
+            format!("src{}", MAX_EVENTS + 4)
+        );
+        assert_eq!(events.front().unwrap().source, "src5");
     }
 
     #[test]

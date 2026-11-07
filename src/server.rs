@@ -1,4 +1,4 @@
-use crate::admin;
+use crate::admin::{self, EventKind};
 use crate::auth_throttle::{AuthThrottle, Failure, SourceKey};
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
@@ -282,16 +282,33 @@ impl<T: 'static + Transport> Server<T> {
 /// Log a failed handshake and count it against the source. Logging stops once
 /// the source is banned, so a scanner produces a bounded number of lines.
 fn note_handshake_failure(throttle: &AuthThrottle, addr: SocketAddr, err: &anyhow::Error) {
-    match throttle.record_failure(addr.ip()) {
-        Failure::Counted(_) => warn!(addr = %log_ip(addr), "{:#}", err),
-        Failure::Banned => warn!(
-            addr = %log_ip(addr),
-            "{:#}. Refusing {} for {}s after repeated failed handshakes",
-            err,
-            log_ip(SourceKey::from_ip(addr.ip())),
-            throttle.ban_duration().as_secs()
-        ),
-        Failure::AlreadyBanned => debug!(addr = %log_ip(addr), "{:#}", err),
+    let failure = throttle.record_failure(addr.ip());
+    let peer = log_ip(addr);
+    if failure == Failure::AlreadyBanned {
+        debug!(addr = %peer, "{:#}", err);
+        return;
+    }
+    let msg = format!("{:#}", err);
+    if failure == Failure::Banned {
+        let range = SourceKey::from_ip(addr.ip());
+        let ban_secs = throttle.ban_duration().as_secs();
+        warn!(
+            addr = %peer,
+            "{}. Refusing {} for {}s after repeated failed handshakes",
+            msg,
+            log_ip(range),
+            ban_secs
+        );
+        admin::record_event(EventKind::HandshakeFailed, addr, msg, None);
+        admin::record_event(
+            EventKind::SourceBanned,
+            range,
+            "repeated failed handshakes".into(),
+            Some(ban_secs),
+        );
+    } else {
+        warn!(addr = %peer, "{}", msg);
+        admin::record_event(EventKind::HandshakeFailed, addr, msg, None);
     }
 }
 
