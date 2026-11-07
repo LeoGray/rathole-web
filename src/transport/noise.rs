@@ -1,14 +1,12 @@
 use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context as TaskContext, Poll};
 
 use super::{AddrMaybeCached, SocketOpts, TcpTransport, Transport, TransportRole};
 use crate::config::{NoiseConfig, TransportConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use snowstorm::snow::params::DHChoice;
+use snowstorm::snow::resolvers::{CryptoResolver, DefaultResolver};
 use snowstorm::{Builder, NoiseParams, NoiseStream};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
 /// How the pattern's initiator (the rathole client) presents its static key,
@@ -66,43 +64,47 @@ impl NoiseTransport {
     /// KK and other `K` patterns with several allowed client keys: the server
     /// needs the client key before it can read the first message, so try each
     /// one. Only the right key authenticates the message (its `ss` term keys
-    /// the payload's AEAD tag). Then replay the message into a normal handshake.
-    async fn handshake_known_client(
-        &self,
-        mut conn: TcpStream,
-    ) -> Result<NoiseStream<PrefixedStream>> {
+    /// the payload's AEAD tag). snowstorm continues the handshake from the
+    /// state that read it.
+    async fn handshake_known_client(&self, mut conn: TcpStream) -> Result<NoiseStream<TcpStream>> {
         let len = conn.read_u16_le().await? as usize;
         let mut msg = vec![0u8; len];
         conn.read_exact(&mut msg).await?;
 
         let mut payload = vec![0u8; len];
-        let key = self
+        let state = self
             .remote_public_keys
             .iter()
-            .find(|k| {
-                self.builder(Some(k))
-                    .build_responder()
-                    .map(|mut state| state.read_message(&msg, &mut payload).is_ok())
-                    .unwrap_or(false)
+            .find_map(|k| {
+                let mut state = self.builder(Some(k)).build_responder().ok()?;
+                state.read_message(&msg, &mut payload).ok()?;
+                Some(state)
             })
             .ok_or_else(|| anyhow!("Noise handshake from a client key that isn't allowed"))?;
-
-        let mut prefix = Vec::with_capacity(2 + len);
-        prefix.extend_from_slice(&(len as u16).to_le_bytes());
-        prefix.extend_from_slice(&msg);
-        Ok(NoiseStream::handshake(
-            PrefixedStream::with_prefix(conn, prefix),
-            self.builder(Some(key)).build_responder()?,
-        )
-        .await?)
+        Ok(NoiseStream::handshake(conn, state).await?)
     }
+}
+
+/// Decode a base64 key and check it has the length the pattern's DH needs
+fn decode_key(what: &str, encoded: &str, len: usize, pattern: &str) -> Result<Vec<u8>> {
+    let key = base64::decode(encoded).with_context(|| format!("Failed to decode {}", what))?;
+    if key.len() != len {
+        bail!(
+            "{} is {} bytes, but {} needs {}",
+            what,
+            key.len(),
+            pattern,
+            len
+        );
+    }
+    Ok(key)
 }
 
 #[async_trait]
 impl Transport for NoiseTransport {
     type Acceptor = TcpListener;
     type RawStream = TcpStream;
-    type Stream = snowstorm::stream::NoiseStream<PrefixedStream>;
+    type Stream = snowstorm::stream::NoiseStream<TcpStream>;
 
     fn new(config: &TransportConfig, role: TransportRole) -> Result<Self> {
         let tcp = TcpTransport::new(config, role)?;
@@ -111,12 +113,13 @@ impl Transport for NoiseTransport {
             Some(v) => v.clone(),
             None => return Err(anyhow!("Missing noise config")),
         };
-        let builder = Builder::new(config.pattern.parse()?);
         let params: NoiseParams = config.pattern.parse()?;
-        let key_len = match params.dh {
-            DHChoice::Curve25519 => 32,
-            DHChoice::Ed448 => 56,
-        };
+        let dh = DefaultResolver.resolve_dh(&params.dh).ok_or_else(|| {
+            anyhow!(
+                "{} uses a DH function this build doesn't support",
+                config.pattern
+            )
+        })?;
         let initiator_static = InitiatorStatic::from_pattern(&config.pattern)?;
 
         let mut remote_public_keys: Vec<Vec<u8>> = Vec::new();
@@ -126,17 +129,8 @@ impl Transport for NoiseTransport {
             .chain(config.remote_public_keys.iter().flatten())
             .enumerate()
         {
-            let key = base64::decode(x)
-                .with_context(|| format!("Failed to decode remote public key #{}", i + 1))?;
-            if key.len() != key_len {
-                bail!(
-                    "Remote public key #{} is {} bytes, but {} needs {}",
-                    i + 1,
-                    key.len(),
-                    config.pattern,
-                    key_len
-                );
-            }
+            let what = format!("remote public key #{}", i + 1);
+            let key = decode_key(&what, x, dh.pub_len(), &config.pattern)?;
             if !remote_public_keys.contains(&key) {
                 remote_public_keys.push(key);
             }
@@ -166,18 +160,9 @@ impl Transport for NoiseTransport {
         }
 
         let local_private_key = match &config.local_private_key {
-            Some(x) => base64::decode(x.as_bytes())
-                .with_context(|| "Failed to decode local_private_key")?,
-            None => builder.generate_keypair()?.private,
+            Some(x) => decode_key("local_private_key", x, dh.priv_len(), &config.pattern)?,
+            None => Builder::new(params.clone()).generate_keypair()?.private,
         };
-        if local_private_key.len() != key_len {
-            bail!(
-                "local_private_key is {} bytes, but {} needs {}",
-                local_private_key.len(),
-                config.pattern,
-                key_len
-            );
-        }
 
         Ok(NoiseTransport {
             tcp,
@@ -190,7 +175,7 @@ impl Transport for NoiseTransport {
     }
 
     fn hint(conn: &Self::Stream, opt: SocketOpts) {
-        opt.apply(conn.get_inner().get_ref());
+        opt.apply(conn.get_inner());
     }
 
     async fn bind<T: ToSocketAddrs + Send + Sync>(&self, addr: T) -> Result<Self::Acceptor> {
@@ -211,7 +196,7 @@ impl Transport for NoiseTransport {
             // The client sends its key: check it against the allowed ones
             InitiatorStatic::Transmitted if !keys.is_empty() => {
                 NoiseStream::handshake_with_verifier(
-                    PrefixedStream::new(conn),
+                    conn,
                     self.builder(None).build_responder()?,
                     |k| {
                         if keys.iter().any(|x| x.as_slice() == k) {
@@ -226,19 +211,15 @@ impl Transport for NoiseTransport {
                 .await
                 .map_err(Into::into)
             }
-            InitiatorStatic::Known => NoiseStream::handshake(
-                PrefixedStream::new(conn),
-                self.builder(keys.first().map(Vec::as_slice))
-                    .build_responder()?,
-            )
-            .await
-            .map_err(Into::into),
-            _ => NoiseStream::handshake(
-                PrefixedStream::new(conn),
-                self.builder(None).build_responder()?,
-            )
-            .await
-            .map_err(Into::into),
+            // A single known client key, or none to check
+            _ => {
+                let key = (self.initiator_static == InitiatorStatic::Known)
+                    .then(|| keys.first().map(Vec::as_slice))
+                    .flatten();
+                NoiseStream::handshake(conn, self.builder(key).build_responder()?)
+                    .await
+                    .map_err(Into::into)
+            }
         };
         conn.with_context(|| "Failed to do noise handshake")
     }
@@ -251,79 +232,13 @@ impl Transport for NoiseTransport {
             .with_context(|| "Failed to connect TCP socket")?;
 
         let conn = NoiseStream::handshake(
-            PrefixedStream::new(conn),
+            conn,
             self.builder(self.remote_public_keys.first().map(Vec::as_slice))
                 .build_initiator()?,
         )
         .await
         .with_context(|| "Failed to do noise handshake")?;
         return Ok(conn);
-    }
-}
-
-/// A TCP stream that first yields bytes already read from it, so a handshake
-/// message inspected by the server can be fed to the real handshake
-#[derive(Debug)]
-pub struct PrefixedStream {
-    prefix: Vec<u8>,
-    pos: usize,
-    inner: TcpStream,
-}
-
-impl PrefixedStream {
-    fn new(inner: TcpStream) -> PrefixedStream {
-        Self::with_prefix(inner, Vec::new())
-    }
-
-    fn with_prefix(inner: TcpStream, prefix: Vec<u8>) -> PrefixedStream {
-        PrefixedStream {
-            prefix,
-            pos: 0,
-            inner,
-        }
-    }
-
-    pub fn get_ref(&self) -> &TcpStream {
-        &self.inner
-    }
-}
-
-impl AsyncRead for PrefixedStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        if this.pos < this.prefix.len() {
-            let n = buf.remaining().min(this.prefix.len() - this.pos);
-            buf.put_slice(&this.prefix[this.pos..this.pos + n]);
-            this.pos += n;
-            if this.pos == this.prefix.len() {
-                this.prefix = Vec::new();
-                this.pos = 0;
-            }
-            return Poll::Ready(Ok(()));
-        }
-        Pin::new(&mut this.inner).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for PrefixedStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
