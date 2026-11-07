@@ -3,6 +3,7 @@
 compile_error!("Enable at least one of features `client` or `server`.");
 
 mod admin;
+mod auth_throttle;
 mod cli;
 mod config;
 mod config_watcher;
